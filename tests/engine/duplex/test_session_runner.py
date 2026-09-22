@@ -988,21 +988,34 @@ async def test_answer_continues_when_the_segment_end_arrives_before_the_answer()
 
 @pytest.mark.asyncio
 async def test_a_dropped_continuation_is_not_re_aimed_across_a_barge_in() -> None:
-    """The re-aim in #7729 stays inside the epoch that planned the unit."""
+    """The re-aim in #7729 stays inside the epoch that planned the unit.
+
+    The next answer must open while the old continuation is still waiting out
+    its chunk period, so this drives the runner with ``submit``/``deliver`` and
+    short sleeps. ``run``/``settle`` would wait for that continuation to drop
+    first, and then a fix that re-arms with the current epoch passes too.
+    """
     h = await open_harness()
     try:
         for _ in range(2):
             await h.run(append_audio())
         request_id = h.stage0_request_id()
 
-        # Plan a continuation for the model turn of epoch 0.
+        # Plan a continuation for the model turn of epoch 0. It waits for up to
+        # one chunk period (1 s) before it submits.
         h.deliver(tts_output(request_id, samples=0, text="", tts_is_last_chunk=True))
         await asyncio.sleep(0.1)
 
         # The user barges in while it waits, and the next turn opens its own answer.
-        await h.run(commands.BargeIn())
-        await h.run(append_audio())
-        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, text="hi", epoch=1))
+        h.submit(commands.BargeIn())
+        await asyncio.sleep(0.1)
+        assert h.session.epoch == 1
+        h.submit(append_audio())
+        await asyncio.sleep(0.1)
+        assert any(task.get_name() == "duplex-continue" and not task.done() for task in h.runner._background_tasks), (
+            "the old continuation should still be waiting when the new answer opens"
+        )
+        h.deliver(tts_output(h.stage0_request_id(), samples=24000, text="hi", epoch=1))
         await h.settle(idle_s=2.5, timeout_s=8.0)
 
         assert h.session.epoch == 1
