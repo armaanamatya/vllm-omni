@@ -188,7 +188,7 @@ def _fake_request(param: Any, *, diffusion: bool) -> SimpleNamespace:
     marker = SimpleNamespace(name="diffusion") if diffusion else None
     return SimpleNamespace(
         param=param,
-        fixturename="async_omni_runner",
+        fixturename="async_omni_runner_function",
         node=SimpleNamespace(get_closest_marker=lambda name: marker if name == "diffusion" else None),
     )
 

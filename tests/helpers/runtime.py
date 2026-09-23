@@ -15,7 +15,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -157,7 +157,7 @@ class OmniServerParams(NamedTuple):
 
 
 class AsyncOmniParams(NamedTuple):
-    """Indirect parameter for the ``async_omni_runner`` / ``async_omni`` fixtures.
+    """Indirect parameter for the ``async_omni_runner`` / ``async_omni_runner_function`` fixtures.
 
     ``extra_omni_kwargs`` are forwarded to :class:`AsyncOmniRunner` and from
     there to ``AsyncOmni`` (``enforce_eager``, ``enable_sleep_mode``,
@@ -661,6 +661,24 @@ class OmniServerStageCli(OmniServer):
         cleanup_test_environment()
 
 
+def _teardown_engine(close: Callable[[], None] | None, worker_pids: Iterable[int]) -> None:
+    """Shared runner teardown: close the engine, kill engine workers that survived, reset the device.
+
+    The PID set is the union of the snapshot taken while the engine was alive and
+    a fresh scan, so daemon workers reparented once ``StageDiffusionProc`` was
+    joined and workers spawned by a constructor that raised are both covered.
+    """
+    pids = sorted({*worker_pids, *snapshot_engine_worker_pids()})
+    try:
+        if close is not None:
+            close()
+    finally:
+        reaped = reap_engine_worker_pids(pids)
+        if reaped:
+            print(f"Killed leftover engine workers after shutdown: {reaped}", flush=True)
+        cleanup_test_environment()
+
+
 class OmniRunner:
     def __init__(
         self,
@@ -685,6 +703,7 @@ class OmniRunner:
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
         self.omni: Any = None
+        self._worker_pids: list[int] = []
         try:
             from vllm_omni.entrypoints.omni import Omni
 
@@ -704,6 +723,7 @@ class OmniRunner:
             # when construction fails after worker processes have started.
             self.__exit__(None, None, None)
             raise
+        self._worker_pids = snapshot_engine_worker_pids()
 
     def get_default_sampling_params_list(self) -> list[Any]:
         if not hasattr(self.omni, "default_sampling_params_list"):
@@ -925,50 +945,14 @@ class OmniRunner:
     def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         return self.omni.stop_profile(stages=stages)
 
-    def _cleanup_process(self):
-        try:
-            keywords = ["enginecore"]
-            matched = []
-            for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
-                try:
-                    cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
-                    name = proc.name().lower()
-                    if any(k in cmdline for k in keywords) or any(k in name for k in keywords):
-                        print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
-                        matched.append(proc)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            for proc in matched:
-                try:
-                    proc.terminate()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            _, still_alive = psutil.wait_procs(matched, timeout=5)
-            for proc in still_alive:
-                try:
-                    proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            if still_alive:
-                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
-                if stubborn:
-                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
-                else:
-                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
-            elif matched:
-                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
-        except Exception as e:
-            print(f"Error in psutil vllm cleanup: {e}")
-
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         omni = getattr(self, "omni", None)
-        if omni is not None and hasattr(omni, "close"):
-            omni.close()
-        self._cleanup_process()
-        cleanup_test_environment()
+        close = omni.close if omni is not None and hasattr(omni, "close") else None
+        pids, self._worker_pids = getattr(self, "_worker_pids", []), []
+        _teardown_engine(close, pids)
 
 
 class AsyncOmniRunner:
@@ -985,8 +969,8 @@ class AsyncOmniRunner:
 
     ``AsyncOmni.__init__`` is synchronous; the coroutine methods bind to the
     event loop of their first call, so keep one runner per event loop (the
-    function-scoped ``async_omni_runner`` fixture) unless every consumer shares
-    the same ``loop_scope``.
+    function-scoped ``async_omni_runner_function`` fixture) unless every
+    consumer shares the same ``loop_scope``.
     """
 
     def __init__(
@@ -1039,19 +1023,9 @@ class AsyncOmniRunner:
         if self._closed:
             return
         self._closed = True
-        # Re-snapshot: a constructor that raised never recorded its workers, and
-        # replicas restarted since the first snapshot carry new PIDs.
-        pids = sorted({*self._worker_pids, *snapshot_engine_worker_pids()})
-        self._worker_pids = []
+        pids, self._worker_pids = self._worker_pids, []
         engine, self.engine = self.engine, None
-        try:
-            if engine is not None:
-                engine.shutdown()
-        finally:
-            reaped = reap_engine_worker_pids(pids)
-            if reaped:
-                print(f"AsyncOmniRunner killed leftover engine workers: {reaped}", flush=True)
-            cleanup_test_environment()
+        _teardown_engine(engine.shutdown if engine is not None else None, pids)
 
     def __enter__(self) -> "AsyncOmniRunner":
         return self
@@ -1213,7 +1187,7 @@ def iter_async_omni(
     run_level: str,
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, None, None]:
-    """Yield an :class:`AsyncOmniRunner`; used by ``async_omni_runner`` / ``async_omni`` fixtures.
+    """Yield an :class:`AsyncOmniRunner`; used by ``async_omni_runner`` / ``async_omni_runner_function`` fixtures.
 
     Applies the same model prefix, run-level deploy YAML patching and
     ``core_model`` tiny-model rewrite (``diffusion``-marked tests) as
@@ -1223,7 +1197,7 @@ def iter_async_omni(
 
     params = getattr(request, "param", None)
     if not isinstance(params, AsyncOmniParams):
-        fixture_name = getattr(request, "fixturename", "async_omni_runner")
+        fixture_name = getattr(request, "fixturename", "async_omni_runner_function")
         raise ValueError(
             f"{fixture_name} must be parametrized (indirect=True) with "
             f"AsyncOmniParams(model, deploy_config=..., extra_omni_kwargs=...), got {params!r}"

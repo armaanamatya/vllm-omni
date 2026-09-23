@@ -60,14 +60,14 @@ _SLEEP_PARAMS = [
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("async_omni_runner", _INLINE_PARAMS, indirect=True)
-async def test_list_loras_inline_mode(async_omni_runner):
+@pytest.mark.parametrize("async_omni_runner_function", _INLINE_PARAMS, indirect=True)
+async def test_list_loras_inline_mode(async_omni_runner_function):
     """list_loras() must not crash in inline diffusion mode.
 
     This is the exact call that vLLMOmniHttpServer.generate() makes
     before every generation request.
     """
-    engine = async_omni_runner.engine
+    engine = async_omni_runner_function.engine
 
     result = await engine.list_loras()
     assert isinstance(result, list), f"Expected list, got {type(result)}"
@@ -77,10 +77,10 @@ async def test_list_loras_inline_mode(async_omni_runner):
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("async_omni_runner", _INLINE_PARAMS, indirect=True)
-async def test_collective_rpc_inline_mode(async_omni_runner):
+@pytest.mark.parametrize("async_omni_runner_function", _INLINE_PARAMS, indirect=True)
+async def test_collective_rpc_inline_mode(async_omni_runner_function):
     """collective_rpc() must delegate to the inline engine, not stage queues."""
-    engine = async_omni_runner.engine
+    engine = async_omni_runner_function.engine
 
     result = await engine.collective_rpc(method="list_loras")
     assert isinstance(result, list), f"Expected list, got {type(result)}"
@@ -91,10 +91,10 @@ async def test_collective_rpc_inline_mode(async_omni_runner):
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("async_omni_runner", _INLINE_PARAMS, indirect=True)
-async def test_sleep_wake_up_inline_mode(async_omni_runner):
+@pytest.mark.parametrize("async_omni_runner_function", _INLINE_PARAMS, indirect=True)
+async def test_sleep_wake_up_inline_mode(async_omni_runner_function):
     """sleep() and wake_up() must work in inline diffusion mode."""
-    engine = async_omni_runner.engine
+    engine = async_omni_runner_function.engine
 
     await engine.sleep(level=1)
     assert await engine.is_sleeping()
@@ -107,15 +107,15 @@ async def test_sleep_wake_up_inline_mode(async_omni_runner):
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("async_omni_runner", _INLINE_PARAMS, indirect=True)
-async def test_generate_after_list_loras_inline_mode(async_omni_runner):
+@pytest.mark.parametrize("async_omni_runner_function", _INLINE_PARAMS, indirect=True)
+async def test_generate_after_list_loras_inline_mode(async_omni_runner_function):
     """Full flow: list_loras() then generate(), matching vLLMOmniHttpServer.
 
     This reproduces the exact sequence that caused the original crash:
     1. list_loras() (was crashing with AssertionError on _out_q)
     2. generate() (should succeed)
     """
-    engine = async_omni_runner.engine
+    engine = async_omni_runner_function.engine
 
     # Step 1: list_loras (the call that was crashing)
     loras = await engine.list_loras()
@@ -148,8 +148,8 @@ async def test_generate_after_list_loras_inline_mode(async_omni_runner):
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("async_omni_runner", _SLEEP_PARAMS, indirect=True)
-async def test_sleep_memory_reclaimed_custom_pipeline(async_omni_runner):
+@pytest.mark.parametrize("async_omni_runner_function", _SLEEP_PARAMS, indirect=True)
+async def test_sleep_memory_reclaimed_custom_pipeline(async_omni_runner_function):
     """sleep(level=1) must physically reclaim CuMemAllocator-tracked memory for
     custom_pipeline.
 
@@ -164,7 +164,7 @@ async def test_sleep_memory_reclaimed_custom_pipeline(async_omni_runner):
     sleep(level=1). The tracked allocations must transition to the allocator's
     asleep state and report physical reclamation.
     """
-    engine = async_omni_runner.engine
+    engine = async_omni_runner_function.engine
 
     assert not await engine.is_sleeping(), "Engine should be awake after creation"
 
