@@ -128,11 +128,11 @@ def omni_runner(request: pytest.FixtureRequest, run_level: str) -> Generator[Omn
 
 
 @pytest.fixture(scope="function")
-def async_omni_runner(
+def async_omni_runner_function(
     request: pytest.FixtureRequest,
     run_level: str,
 ) -> Generator[AsyncOmniRunner, Any, None]:
-    """Function-scoped in-process :class:`~tests.helpers.runtime.AsyncOmniRunner`.
+    """Function-scoped in-process :class:`~tests.helpers.runtime.AsyncOmniRunner` (cf. :func:`omni_runner_function`).
 
     The default for live ``AsyncOmni`` tests. Parametrize with
     :class:`~tests.helpers.runtime.AsyncOmniParams` and ``indirect=True``. One
@@ -146,12 +146,13 @@ def async_omni_runner(
 
 
 @pytest.fixture(scope="module")
-def async_omni(request: pytest.FixtureRequest, run_level: str) -> Generator[AsyncOmniRunner, Any, None]:
+def async_omni_runner(request: pytest.FixtureRequest, run_level: str) -> Generator[AsyncOmniRunner, Any, None]:
     """Module-scoped :class:`~tests.helpers.runtime.AsyncOmniRunner` (cf. :func:`omni_runner`).
 
     Only for modules whose every consumer is marked
     ``@pytest.mark.asyncio(loop_scope="module")`` with the same params: the
-    engine binds to the first event loop that awaits it.
+    engine binds to the first event loop that awaits it. Prefer
+    :func:`async_omni_runner_function` otherwise.
     """
     from tests.helpers.runtime import iter_async_omni
 
