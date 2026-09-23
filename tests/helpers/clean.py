@@ -14,7 +14,6 @@ import logging
 import os
 import subprocess
 import time
-from collections.abc import Iterable
 
 import psutil
 
@@ -298,53 +297,11 @@ def is_engine_worker_process(proc: psutil.Process) -> bool:
     return any(marker in blob for marker in ENGINE_WORKER_PROCESS_MARKERS)
 
 
-def snapshot_engine_worker_pids() -> list[int]:
-    """PIDs of the engine workers currently running under this process.
-
-    Take the snapshot while the engine is alive, **before** ``shutdown()``:
-    diffusion workers are daemon children of ``StageDiffusionProc``, so once
-    that subprocess is joined they are reparented and a later
-    ``children(recursive=True)`` scan no longer sees them although they can
-    still hold device memory.
-    """
-    try:
-        children = psutil.Process().children(recursive=True)
-    except psutil.Error:
-        return []
-    return [proc.pid for proc in children if is_engine_worker_process(proc)]
-
-
-def reap_engine_worker_pids(pids: Iterable[int], *, timeout_s: float = 3.0) -> list[int]:
-    """Kill the processes in *pids* that are still alive; return the PIDs that were killed.
-
-    ``shutdown()`` already attempted a graceful exit, so this goes straight to
-    ``SIGKILL``: a ``SIGTERM`` grace period only delays the kill for CUDA
-    workers that ignore it.
-    """
-    procs: list[psutil.Process] = []
-    for pid in pids:
-        try:
-            procs.append(psutil.Process(pid))
-        except psutil.NoSuchProcess:
-            continue
-    if not procs:
-        return []
-    for proc in procs:
-        try:
-            proc.kill()
-        except psutil.Error:
-            pass
-    psutil.wait_procs(procs, timeout=timeout_s)
-    return [proc.pid for proc in procs]
-
-
 __all__ = [
     "ENGINE_WORKER_PROCESS_MARKERS",
     "cleanup_test_environment",
     "get_physical_device_indices",
     "is_engine_worker_process",
     "pick_least_used_device_indices",
-    "reap_engine_worker_pids",
-    "snapshot_engine_worker_pids",
     "wait_for_gpu_memory_to_clear",
 ]

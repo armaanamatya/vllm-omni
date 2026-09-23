@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Tests for the in-process ``AsyncOmni`` harness and the engine-worker reap helpers.
+"""Tests for the in-process ``AsyncOmni`` harness and the engine-worker matcher.
 
 Covers ``AsyncOmniRunner`` teardown order (success, test failure, constructor
-failure, ``shutdown()`` failure), the ``iter_async_omni`` parameter contract
-behind ``async_omni_runner`` / ``async_omni``, and the PID snapshot / reap
-helpers in ``tests.helpers.clean``. No engine is started.
+failure, ``shutdown()`` failure), worker ownership on teardown, the
+``iter_async_omni`` parameter contract behind ``async_omni_runner`` /
+``async_omni``, and ``is_engine_worker_process`` in ``tests.helpers.clean``.
+No engine is started.
 """
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
+from collections.abc import Generator
 from types import SimpleNamespace
 from typing import Any
 
@@ -30,35 +34,18 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # ---------------------------------------------------------------------------
 
 
-class _Lifecycle:
-    """Cleanup calls made by the runner, in order; ``snapshots`` feeds the PID snapshot."""
-
-    def __init__(self) -> None:
-        self.events: list[Any] = []
-        self.snapshots: list[list[int]] = []
-
-
 @pytest.fixture
-def lifecycle(monkeypatch: pytest.MonkeyPatch) -> _Lifecycle:
-    state = _Lifecycle()
-
-    def _snapshot() -> list[int]:
-        state.events.append("snapshot")
-        return state.snapshots.pop(0) if state.snapshots else []
-
-    def _reap(pids, **kwargs) -> list[int]:
-        state.events.append(("reap", list(pids)))
-        return list(pids)
-
-    monkeypatch.setattr(runtime_mod, "cleanup_test_environment", lambda: state.events.append("env"))
-    monkeypatch.setattr(runtime_mod, "snapshot_engine_worker_pids", _snapshot)
-    monkeypatch.setattr(runtime_mod, "reap_engine_worker_pids", _reap)
-    return state
+def events(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Cleanup calls made by the runner, in order."""
+    calls: list[str] = []
+    monkeypatch.setattr(runtime_mod, "cleanup_test_environment", lambda: calls.append("env"))
+    monkeypatch.setattr(AsyncOmniRunner, "_cleanup_process", lambda self: calls.append("process"))
+    return calls
 
 
 def _install_fake_async_omni(
     monkeypatch: pytest.MonkeyPatch,
-    lifecycle: _Lifecycle,
+    events: list[str],
     *,
     shutdown_error: BaseException | None = None,
 ):
@@ -69,10 +56,10 @@ def _install_fake_async_omni(
             self.kwargs = kwargs
             self.answer = 42
             _FakeAsyncOmni.instances.append(self)
-            lifecycle.events.append("construct")
+            events.append("construct")
 
         def shutdown(self) -> None:
-            lifecycle.events.append("shutdown")
+            events.append("shutdown")
             if shutdown_error is not None:
                 raise shutdown_error
 
@@ -81,11 +68,9 @@ def _install_fake_async_omni(
 
 
 def test_runner_init_rolls_back_on_async_omni_startup_failure(
-    monkeypatch: pytest.MonkeyPatch, lifecycle: _Lifecycle
+    monkeypatch: pytest.MonkeyPatch, events: list[str]
 ) -> None:
-    """``__exit__`` is skipped when construction raises; workers spawned before the
-    failure must still be reaped and the device reset."""
-    lifecycle.snapshots.append([11, 12])
+    """``__exit__`` is skipped when construction raises; rollback must still run."""
 
     class _BoomAsyncOmni:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -99,15 +84,14 @@ def test_runner_init_rolls_back_on_async_omni_startup_failure(
 
     # Once at the start of ``__init__``, once from the constructor rollback; no
     # ``shutdown`` because no engine instance exists.
-    assert lifecycle.events == ["env", "snapshot", ("reap", [11, 12]), "env"]
+    assert events == ["env", "process", "env"]
 
 
-def test_runner_teardown_order_and_engine_proxy(monkeypatch: pytest.MonkeyPatch, lifecycle: _Lifecycle) -> None:
-    lifecycle.snapshots.extend([[21], [21, 22]])
-    fake_cls = _install_fake_async_omni(monkeypatch, lifecycle)
+def test_runner_teardown_order_and_engine_proxy(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
+    fake_cls = _install_fake_async_omni(monkeypatch, events)
 
     with AsyncOmniRunner("fake-model", deploy_config="deploy.yaml", enforce_eager=True) as runner:
-        lifecycle.events.append("body")
+        events.append("body")
         engine = fake_cls.instances[-1]
         assert runner.engine is engine
         # Attribute access falls through to the engine so tests can call
@@ -122,47 +106,120 @@ def test_runner_teardown_order_and_engine_proxy(monkeypatch: pytest.MonkeyPatch,
             "enforce_eager": True,
         }
 
-    # PIDs are snapshotted again *before* shutdown (the constructor snapshot can
-    # miss workers that were reparented later), then shutdown, reap, cleanup.
-    assert lifecycle.events == [
-        "env",
-        "construct",
-        "snapshot",
-        "body",
-        "snapshot",
-        "shutdown",
-        ("reap", [21, 22]),
-        "env",
-    ]
+    assert events == ["env", "construct", "body", "shutdown", "process", "env"]
 
     # ``close()`` is idempotent and the engine reference is dropped.
     runner.close()
-    assert lifecycle.events.count("shutdown") == 1
-    assert lifecycle.events.count("env") == 2
+    assert events.count("shutdown") == 1
+    assert events.count("env") == 2
     assert runner.engine is None
     with pytest.raises(AttributeError):
         _ = runner.answer
 
 
-def test_runner_teardown_runs_when_body_raises(monkeypatch: pytest.MonkeyPatch, lifecycle: _Lifecycle) -> None:
-    _install_fake_async_omni(monkeypatch, lifecycle)
+def test_runner_teardown_runs_when_body_raises(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
+    _install_fake_async_omni(monkeypatch, events)
 
     with pytest.raises(ValueError, match="body failed"):
         with AsyncOmniRunner("fake-model"):
             raise ValueError("body failed")
 
-    assert lifecycle.events[-3:] == ["shutdown", ("reap", []), "env"]
+    assert events[-3:] == ["shutdown", "process", "env"]
 
 
-def test_runner_reaps_and_cleans_when_shutdown_raises(monkeypatch: pytest.MonkeyPatch, lifecycle: _Lifecycle) -> None:
-    lifecycle.snapshots.extend([[31], []])
-    _install_fake_async_omni(monkeypatch, lifecycle, shutdown_error=RuntimeError("shutdown boom"))
+def test_runner_cleans_up_when_shutdown_raises(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
+    _install_fake_async_omni(monkeypatch, events, shutdown_error=RuntimeError("shutdown boom"))
 
     with pytest.raises(RuntimeError, match="shutdown boom"):
         with AsyncOmniRunner("fake-model"):
             pass
 
-    assert lifecycle.events[-3:] == ["shutdown", ("reap", [31]), "env"]
+    assert events[-3:] == ["shutdown", "process", "env"]
+
+
+# ---------------------------------------------------------------------------
+# AsyncOmniRunner worker ownership (real subprocesses)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def live_workers() -> Generator[list[subprocess.Popen[bytes]], None, None]:
+    workers: list[subprocess.Popen[bytes]] = []
+    try:
+        yield workers
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.kill()
+            worker.wait(timeout=10)
+            if worker.stdout is not None:
+                worker.stdout.close()
+
+
+def _start_engine_worker(
+    workers: list[subprocess.Popen[bytes]], *, title: str = "enginecore"
+) -> subprocess.Popen[bytes]:
+    script = "import time; print('ready', flush=True); time.sleep(90)"
+    worker = subprocess.Popen([sys.executable, "-c", script, title], stdout=subprocess.PIPE)
+    workers.append(worker)
+    assert worker.stdout is not None
+    assert worker.stdout.readline() == b"ready\n"
+    return worker
+
+
+@pytest.mark.parametrize("shutdown_raises", [False, True])
+def test_runner_cleanup_preserves_unrelated_engine_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    live_workers: list[subprocess.Popen[bytes]],
+    shutdown_raises: bool,
+) -> None:
+    existing = _start_engine_worker(live_workers)
+    owned: list[subprocess.Popen[bytes]] = []
+    late_unrelated: list[subprocess.Popen[bytes]] = []
+    monkeypatch.setattr(runtime_mod, "cleanup_test_environment", lambda: None)
+
+    class _OwnedAsyncOmni:
+        def __init__(self, **kwargs: Any) -> None:
+            owned.append(_start_engine_worker(live_workers))
+            # Diffusion workers carry a different process title than EngineCore.
+            owned.append(_start_engine_worker(live_workers, title="vLLM-Omni::DiffusionWorker_0"))
+
+        def shutdown(self) -> None:
+            late_unrelated.append(_start_engine_worker(live_workers))
+            if shutdown_raises:
+                raise RuntimeError("shutdown failed")
+
+    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.AsyncOmni", _OwnedAsyncOmni)
+    if shutdown_raises:
+        with pytest.raises(RuntimeError, match="shutdown failed"), AsyncOmniRunner("fake-model"):
+            pass
+    else:
+        with AsyncOmniRunner("fake-model"):
+            assert all(worker.poll() is None for worker in owned)
+
+    assert all(worker.wait(timeout=10) is not None for worker in owned)
+    assert existing.poll() is None
+    assert late_unrelated[0].poll() is None
+
+
+def test_runner_startup_failure_cleans_only_new_workers(
+    monkeypatch: pytest.MonkeyPatch, live_workers: list[subprocess.Popen[bytes]]
+) -> None:
+    unrelated = _start_engine_worker(live_workers)
+    owned: list[subprocess.Popen[bytes]] = []
+    monkeypatch.setattr(runtime_mod, "cleanup_test_environment", lambda: None)
+
+    class _FailingAsyncOmni:
+        def __init__(self, **kwargs: Any) -> None:
+            owned.append(_start_engine_worker(live_workers))
+            raise RuntimeError("startup failed")
+
+    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.AsyncOmni", _FailingAsyncOmni)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        AsyncOmniRunner("fake-model")
+
+    assert owned[0].wait(timeout=10) is not None
+    assert unrelated.poll() is None
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +245,7 @@ def _fake_request(param: Any, *, diffusion: bool) -> SimpleNamespace:
     marker = SimpleNamespace(name="diffusion") if diffusion else None
     return SimpleNamespace(
         param=param,
-        fixturename="async_omni_runner",
+        fixturename="async_omni_runner_function",
         node=SimpleNamespace(get_closest_marker=lambda name: marker if name == "diffusion" else None),
     )
 
@@ -260,7 +317,7 @@ def test_iter_async_omni_rejects_non_params(fixture_env: list[bool], param: Any)
 
 
 # ---------------------------------------------------------------------------
-# Engine-worker snapshot / reap helpers
+# Engine-worker matcher
 # ---------------------------------------------------------------------------
 
 
@@ -269,7 +326,6 @@ class _FakeProc:
         self.pid = pid
         self._title = title
         self._error = error
-        self.killed = False
 
     def name(self) -> str:
         if self._error is not None:
@@ -278,9 +334,6 @@ class _FakeProc:
 
     def cmdline(self) -> list[str]:
         return self._title.split()
-
-    def kill(self) -> None:
-        self.killed = True
 
 
 @pytest.mark.parametrize(
@@ -301,53 +354,3 @@ def test_is_engine_worker_process_matches_engine_titles(title: str, expected: bo
 def test_is_engine_worker_process_ignores_vanished_processes() -> None:
     proc = _FakeProc(1, "VLLM::EngineCore", error=psutil.NoSuchProcess(1))
     assert clean_mod.is_engine_worker_process(proc) is False
-
-
-def test_snapshot_and_reap_engine_worker_pids(monkeypatch: pytest.MonkeyPatch) -> None:
-    worker = _FakeProc(101, "vLLM-Omni::DiffusionWorker")
-    core = _FakeProc(102, "VLLM::EngineCore")
-    other = _FakeProc(103, "python -c import whisper")
-    by_pid = {101: worker, 102: core, 103: other}
-    waited: list[tuple[list[int], float]] = []
-
-    def _process(pid: int | None = None):
-        if pid is None:
-            return SimpleNamespace(children=lambda recursive: [worker, core, other])
-        if pid not in by_pid:
-            raise psutil.NoSuchProcess(pid)
-        return by_pid[pid]
-
-    def _wait_procs(procs, timeout):
-        waited.append(([p.pid for p in procs], timeout))
-        return [], []
-
-    monkeypatch.setattr(
-        clean_mod,
-        "psutil",
-        SimpleNamespace(
-            Process=_process, wait_procs=_wait_procs, Error=psutil.Error, NoSuchProcess=psutil.NoSuchProcess
-        ),
-    )
-
-    pids = clean_mod.snapshot_engine_worker_pids()
-    assert pids == [101, 102]
-
-    del by_pid[102]  # EngineCore exited on its own after shutdown()
-    assert clean_mod.reap_engine_worker_pids([*pids, 999]) == [101]
-    assert worker.killed
-    assert not other.killed
-    assert waited == [([101], 3.0)]
-
-
-def test_reap_engine_worker_pids_without_targets(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        clean_mod,
-        "psutil",
-        SimpleNamespace(
-            Process=lambda pid: (_ for _ in ()).throw(AssertionError("must not look up processes")),
-            wait_procs=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not wait")),
-            Error=psutil.Error,
-            NoSuchProcess=psutil.NoSuchProcess,
-        ),
-    )
-    assert clean_mod.reap_engine_worker_pids([]) == []
