@@ -280,11 +280,8 @@ class OmniPlatform(Platform):
     def record_device_event(cls):
         """Record a device event on the default stream to mark tensor readiness.
 
-        On platforms where distributed communication (e.g. HCCL) may use
-        internal streams not visible to the default stream, this method
-        should synchronize the default stream before recording the event
-        to ensure the event captures all completed work including
-        cross-device communication results.
+        The consumer waits on the event from a side stream, so implementations
+        should only record it and must not synchronize the stream on the host.
 
         Returns ``None`` by default so that platforms without a native
         implementation (ROCm, XPU, MUSA) fall through to a safe no-op.

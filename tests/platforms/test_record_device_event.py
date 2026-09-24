@@ -109,40 +109,81 @@ class TestNPUOmniPlatformRecordDeviceEvent:
     """Test NPUOmniPlatform.record_device_event with mocked torch.npu."""
 
     def test_returns_none_on_failure(self, mocker):
-        """When torch.npu.current_stream().synchronize() fails, return None."""
+        """When the event cannot be created, return None."""
         try:
             from vllm_omni.platforms.npu.platform import NPUOmniPlatform
         except ModuleNotFoundError:
             pytest.skip("vllm_ascend not available")
 
         mock_torch = mocker.MagicMock()
-        mock_torch.npu.current_stream.return_value.synchronize.side_effect = RuntimeError("no NPU")
+        mock_torch.Event.side_effect = RuntimeError("no NPU")
         mocker.patch("vllm_omni.platforms.npu.platform.torch", mock_torch)
 
         result = NPUOmniPlatform.record_device_event()
         assert result is None
 
-    def test_synchronizes_stream_then_records_generic_event(self, mocker):
-        """NPU should return an event consumable by the generic torch.Stream."""
+    def test_records_generic_event_without_host_sync(self, mocker):
+        """NPU should return an event consumable by the generic torch.Stream,
+        without blocking the host on the stream (~15 ms bubble per request)."""
         try:
             from vllm_omni.platforms.npu.platform import NPUOmniPlatform
         except ModuleNotFoundError:
             pytest.skip("vllm_ascend not available")
 
         mock_event = mocker.MagicMock()
-        mock_stream = mocker.MagicMock()
         mock_torch = mocker.MagicMock()
-        mock_torch.npu.current_stream.return_value = mock_stream
         mock_torch.Event.return_value = mock_event
         mocker.patch("vllm_omni.platforms.npu.platform.torch", mock_torch)
 
         result = NPUOmniPlatform.record_device_event()
 
-        # Stream should be synced first (HCCL ordering)
-        mock_stream.synchronize.assert_called_once()
-        # Then a backend-neutral event should be created and recorded.  The
-        # worker waits on it through the public torch.Stream wrapper.
+        # The side stream orders the D2H through wait_event; a host sync only
+        # delays COMPUTE_DONE and the next request's forward.
+        mock_torch.npu.current_stream.return_value.synchronize.assert_not_called()
+        mock_torch.npu.synchronize.assert_not_called()
+        # A backend-neutral event is created and recorded.  The worker waits
+        # on it through the public torch.Stream wrapper.
         mock_torch.Event.assert_called_once()
         mock_torch.npu.Event.assert_not_called()
         mock_event.record.assert_called_once()
         assert result is mock_event
+
+    @hardware_test(res={"npu": "A3"})
+    def test_recorded_event_orders_side_stream_d2h(self):
+        """On-device: without the host sync, the event alone must make a
+        side-stream D2H wait for compute still running on the current stream."""
+        import torch
+
+        try:
+            from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+        except ModuleNotFoundError:
+            pytest.skip("vllm_ascend not available")
+        if not torch.npu.is_available():
+            pytest.skip("NPU not available")
+
+        device = torch.device("npu", 0)
+        # Normalized so the matmul chain stays finite; the ``* 0.0`` term keeps
+        # every element exactly 7.0 while still depending on the whole chain.
+        base = torch.randn(4096, 4096, device=device) / 64.0
+        chained = base.clone()
+        for _ in range(40):
+            chained = chained @ base
+        tensor = torch.full_like(chained, 7.0) + chained * 0.0
+
+        event = NPUOmniPlatform.record_device_event()
+        assert event is not None
+
+        # Mirrors WorkerProc._async_output_loop.
+        d2h_stream = torch.Stream(device=device)
+        d2h_stream.wait_event(event)
+        previous = torch.accelerator.current_stream()
+        torch.accelerator.set_stream(d2h_stream)
+        try:
+            host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+            host.copy_(tensor, non_blocking=True)
+        finally:
+            torch.accelerator.set_stream(previous)
+        d2h_stream.synchronize()
+
+        copied_early = int((host != 7.0).sum())
+        assert copied_early == 0, f"{copied_early} elements copied before compute finished"
