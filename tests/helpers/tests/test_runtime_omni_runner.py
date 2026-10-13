@@ -62,11 +62,12 @@ def live_workers() -> Generator[list[subprocess.Popen[bytes]], None, None]:
 def _start_engine_worker(
     workers: list[subprocess.Popen[bytes]], *, ignore_terminate: bool = False
 ) -> subprocess.Popen[bytes]:
-    script = "import signal, time; "
+    # Engine workers are recognised by process title, as set by vLLM's ``set_process_title``.
+    script = "import signal, sys, time, setproctitle; setproctitle.setproctitle(sys.argv[1]); "
     if ignore_terminate:
         script += "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
     script += "print('ready', flush=True); time.sleep(90)"
-    worker = subprocess.Popen([sys.executable, "-c", script, "enginecore"], stdout=subprocess.PIPE)
+    worker = subprocess.Popen([sys.executable, "-c", script, "VLLM::EngineCore"], stdout=subprocess.PIPE)
     workers.append(worker)
     assert worker.stdout is not None
     assert worker.stdout.readline() == b"ready\n"

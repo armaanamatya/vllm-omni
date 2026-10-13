@@ -5,13 +5,16 @@
 
 Covers ``AsyncOmniRunner`` teardown order (success, test failure, constructor
 failure, ``shutdown()`` failure), worker ownership on teardown, the
-``iter_async_omni`` parameter contract behind ``async_omni_runner`` /
-``async_omni``, and ``is_engine_worker_process`` in ``tests.helpers.clean``.
-No engine is started.
+``iter_async_omni`` parameter contract behind ``async_omni_runner_function`` /
+``async_omni_runner``, the event loop those fixtures shut the engine down on,
+and ``is_engine_worker_process`` in ``tests.helpers.clean``. No engine is
+started.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
 import subprocess
 import sys
 import threading
@@ -156,14 +159,53 @@ def live_workers() -> Generator[list[subprocess.Popen[bytes]], None, None]:
                 worker.stdout.close()
 
 
+# Engine workers are recognised by process title, so the stand-ins set one the
+# way vLLM's ``set_process_title`` does.
+_WORKER_SCRIPT = (
+    "import sys, time, setproctitle; setproctitle.setproctitle(sys.argv[1]); print('ready', flush=True); time.sleep(90)"
+)
+# Starts a worker, waits until it is titled, prints its pid and exits, which
+# leaves the worker reparented.
+_REPARENTING_SCRIPT = (
+    "import subprocess, sys; "
+    "worker = subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], stdout=subprocess.PIPE); "
+    "worker.stdout.readline(); print(worker.pid, flush=True)"
+)
+
+
 def _start_engine_worker(
-    workers: list[subprocess.Popen[bytes]], *, title: str = "enginecore"
+    workers: list[subprocess.Popen[bytes]], *, title: str = "VLLM::EngineCore"
 ) -> subprocess.Popen[bytes]:
-    script = "import time; print('ready', flush=True); time.sleep(90)"
-    worker = subprocess.Popen([sys.executable, "-c", script, title], stdout=subprocess.PIPE)
+    worker = subprocess.Popen([sys.executable, "-c", _WORKER_SCRIPT, title], stdout=subprocess.PIPE)
     workers.append(worker)
     assert worker.stdout is not None
     assert worker.stdout.readline() == b"ready\n"
+    return worker
+
+
+@pytest.fixture
+def reparented_workers() -> Generator[list[psutil.Process], None, None]:
+    workers: list[psutil.Process] = []
+    try:
+        yield workers
+    finally:
+        for worker in workers:
+            try:
+                worker.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+
+def _start_reparented_engine_worker(workers: list[psutil.Process], *, title: str) -> psutil.Process:
+    """Start a titled worker whose parent has already exited."""
+    done = subprocess.run(
+        [sys.executable, "-c", _REPARENTING_SCRIPT, _WORKER_SCRIPT, title],
+        stdout=subprocess.PIPE,
+        check=True,
+        timeout=30,
+    )
+    worker = psutil.Process(int(done.stdout))
+    workers.append(worker)
     return worker
 
 
@@ -222,8 +264,35 @@ def test_runner_startup_failure_cleans_only_new_workers(
     assert unrelated.poll() is None
 
 
+def test_runner_startup_failure_cleans_reparented_workers(
+    monkeypatch: pytest.MonkeyPatch, reparented_workers: list[psutil.Process]
+) -> None:
+    """Daemon diffusion workers outlive a ``StageDiffusionProc`` that died during startup."""
+    title = "vLLM-Omni::DiffusionWorker_TP0"
+    existing = _start_reparented_engine_worker(reparented_workers, title=title)
+    assert existing.ppid() != os.getpid()
+    monkeypatch.setattr(runtime_mod, "cleanup_test_environment", lambda: None)
+
+    class _FailingAsyncOmni:
+        def __init__(self, **kwargs: Any) -> None:
+            _start_reparented_engine_worker(reparented_workers, title=title)
+            raise RuntimeError("startup failed")
+
+    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.AsyncOmni", _FailingAsyncOmni)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        AsyncOmniRunner("fake-model")
+
+    leaked = reparented_workers[1]
+    _, alive = psutil.wait_procs([leaked], timeout=10)
+    assert not alive
+    # A reparented worker that predates the runner belongs to someone else.
+    assert existing.is_running() and existing.status() != psutil.STATUS_ZOMBIE
+    # Orphans are adopted only while the engine starts.
+    assert _start_reparented_engine_worker(reparented_workers, title=title).ppid() != os.getpid()
+
+
 # ---------------------------------------------------------------------------
-# iter_async_omni (behind the async_omni_runner / async_omni fixtures)
+# iter_async_omni (behind the async_omni_runner_function / async_omni_runner fixtures)
 # ---------------------------------------------------------------------------
 
 
@@ -317,6 +386,76 @@ def test_iter_async_omni_rejects_non_params(fixture_env: list[bool], param: Any)
 
 
 # ---------------------------------------------------------------------------
+# Event loop the fixtures build and shut the engine down on
+# ---------------------------------------------------------------------------
+
+
+class _LoopBoundAsyncOmni:
+    """Like ``AsyncOmni``: a handler task on the loop of the first call, cancelled by the sync ``shutdown()``."""
+
+    loops: list[asyncio.AbstractEventLoop] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.task: asyncio.Task[Any] | None = None
+
+    async def start(self) -> asyncio.AbstractEventLoop:
+        loop = asyncio.get_running_loop()
+        if self.task is None:
+            self.task = loop.create_task(asyncio.Event().wait())
+            _LoopBoundAsyncOmni.loops.append(loop)
+        return loop
+
+    def shutdown(self) -> None:
+        # Raises in the fixture teardown, and so fails the test, when the loop
+        # that owns the handler task is no longer running.
+        assert self.task is not None
+        assert asyncio.get_running_loop() is self.task.get_loop()
+        assert not self.task.done()
+        self.task.cancel()
+
+
+def _stub_runner_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    _LoopBoundAsyncOmni.loops = []
+    monkeypatch.setattr(runtime_mod, "cleanup_test_environment", lambda: None)
+    monkeypatch.setattr(runtime_mod, "release_audio_transcriber", lambda: None)
+    monkeypatch.setattr(runtime_mod, "get_model_prefix", lambda: "")
+    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.AsyncOmni", _LoopBoundAsyncOmni)
+
+
+@pytest.fixture
+def loop_bound_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_runner_environment(monkeypatch)
+
+
+@pytest.fixture(scope="module")
+def loop_bound_engine_module() -> Generator[None, None, None]:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _stub_runner_environment(monkeypatch)
+        yield
+
+
+_LOOP_PARAMS = [pytest.param(AsyncOmniParams(model="fake-model"), id="fake")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_omni_runner_function", _LOOP_PARAMS, indirect=True)
+async def test_function_fixture_shuts_down_on_the_test_loop(
+    loop_bound_engine: None, async_omni_runner_function: AsyncOmniRunner
+) -> None:
+    assert await async_omni_runner_function.start() is asyncio.get_running_loop()
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("async_omni_runner", _LOOP_PARAMS, indirect=True)
+@pytest.mark.parametrize("call", [1, 2])
+async def test_module_fixture_shares_engine_and_loop(
+    loop_bound_engine_module: None, async_omni_runner: AsyncOmniRunner, call: int
+) -> None:
+    assert await async_omni_runner.start() is asyncio.get_running_loop()
+    assert _LoopBoundAsyncOmni.loops == [asyncio.get_running_loop()]
+
+
+# ---------------------------------------------------------------------------
 # Engine-worker matcher
 # ---------------------------------------------------------------------------
 
@@ -330,9 +469,12 @@ class _FakeProc:
     def name(self) -> str:
         if self._error is not None:
             raise self._error
-        return self._title.split()[0]
+        # The kernel keeps 15 characters of the name.
+        return self._title.split()[0][:15]
 
     def cmdline(self) -> list[str]:
+        if self._error is not None:
+            raise self._error
         return self._title.split()
 
 
@@ -340,11 +482,17 @@ class _FakeProc:
     ("title", "expected"),
     [
         ("VLLM::EngineCore", True),
+        ("VLLM::EngineCore_DP1", True),
+        ("VLLM::StageEngineCoreProc_thinker_replica0_DP0", True),
         ("VLLM::Worker_TP0", True),
+        ("vLLM-Omni::DiffusionWorker", True),
         ("vLLM-Omni::DiffusionWorker_TP1", True),
-        ("StageDiffusionProc", True),
+        ("VLLM::APIServer_0", False),
         ("python -m pytest tests/", False),
         ("python -c import whisper", False),
+        # A title in a later argument is not a process title.
+        ("python -c pass vLLM-Omni::DiffusionWorker_0", False),
+        ("python worker.py --tag enginecore", False),
     ],
 )
 def test_is_engine_worker_process_matches_engine_titles(title: str, expected: bool) -> None:

@@ -275,26 +275,32 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
         _print_device_processes()
 
 
-# Lower-cased substrings that identify engine worker processes spawned under the
-# test process: vLLM ``VLLM::EngineCore`` / ``VLLM::Worker_*`` titles, vLLM-Omni
-# diffusion workers (``vLLM-Omni::DiffusionWorker_*``) and the
-# ``StageDiffusionProc`` subprocess. Matched against the psutil name and cmdline
-# (``setproctitle`` rewrites both).
+# Lower-cased process-title prefixes of the engine workers spawned under the test
+# process. vLLM titles its processes ``VLLM::EngineCore[_DP*]`` and
+# ``VLLM::Worker[_*]``; vLLM-Omni adds ``VLLM::StageEngineCoreProc_*`` and
+# ``vLLM-Omni::DiffusionWorker[_*]``. ``StageDiffusionProc`` sets no title, so it
+# cannot be recognised this way.
 ENGINE_WORKER_PROCESS_MARKERS: tuple[str, ...] = (
-    "enginecore",
-    "stagediffusionproc",
+    "vllm::enginecore",
+    "vllm::stageenginecoreproc",
     "vllm::worker",
-    "vllm-omni::",
+    "vllm-omni::diffusionworker",
 )
 
 
 def is_engine_worker_process(proc: psutil.Process) -> bool:
-    """True when *proc* looks like an engine worker (see ``ENGINE_WORKER_PROCESS_MARKERS``)."""
+    """True when the title of *proc* starts with one of ``ENGINE_WORKER_PROCESS_MARKERS``.
+
+    ``setproctitle`` rewrites ``argv[0]``; the kernel name is cut to 15
+    characters, so it is only read when the cmdline is empty. A marker in a
+    later argument (``python -c ... vllm::worker``) does not match.
+    """
     try:
-        blob = " ".join([proc.name(), *proc.cmdline()]).lower()
+        cmdline = proc.cmdline()
+        title = (cmdline[0] if cmdline and cmdline[0] else proc.name()).lower()
     except psutil.Error:
         return False
-    return any(marker in blob for marker in ENGINE_WORKER_PROCESS_MARKERS)
+    return title.startswith(ENGINE_WORKER_PROCESS_MARKERS)
 
 
 __all__ = [

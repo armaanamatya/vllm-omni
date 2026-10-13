@@ -7,6 +7,7 @@ Request clients and response types live in ``tests.helpers.client``;
 this module re-exports them for backward-compatible imports.
 """
 
+import ctypes
 import errno
 import os
 import socket
@@ -651,6 +652,38 @@ class OmniServerStageCli(OmniServer):
         cleanup_test_environment()
 
 
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+
+
+@contextmanager
+def _adopt_orphaned_descendants() -> Generator[None, None, None]:
+    """Reparent descendants orphaned inside the block to this process instead of init.
+
+    When the engine constructor raises after ``StageDiffusionProc`` is gone, its
+    daemon diffusion workers would be reparented to init, out of reach of a scan
+    of this process's children. With the Linux child-subreaper flag
+    (``prctl(2)``) they become children of this process and stay so after the
+    block, where the previous setting is restored. Without ``prctl`` this does
+    nothing.
+    """
+    libc: Any = None
+    was_set = ctypes.c_int(0)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(was_set), 0, 0, 0) != 0:
+            libc = None
+        elif not was_set.value and libc.prctl(_PR_SET_CHILD_SUBREAPER, ctypes.c_ulong(1), 0, 0, 0) != 0:
+            libc = None
+    except (OSError, AttributeError):
+        libc = None
+    try:
+        yield
+    finally:
+        if libc is not None and not was_set.value:
+            libc.prctl(_PR_SET_CHILD_SUBREAPER, ctypes.c_ulong(0), 0, 0, 0)
+
+
 class _EngineWorkerOwner:
     """Engine-worker ownership and teardown shared by :class:`OmniRunner` and
     :class:`AsyncOmniRunner`.
@@ -779,14 +812,15 @@ class OmniRunner(_EngineWorkerOwner):
         try:
             from vllm_omni.entrypoints.omni import Omni
 
-            self.omni = Omni(
-                model=model_name,
-                log_stats=log_stats,
-                stage_init_timeout=stage_init_timeout,
-                init_timeout=init_timeout,
-                deploy_config=deploy_config,
-                **kwargs,
-            )
+            with _adopt_orphaned_descendants():
+                self.omni = Omni(
+                    model=model_name,
+                    log_stats=log_stats,
+                    stage_init_timeout=stage_init_timeout,
+                    init_timeout=init_timeout,
+                    deploy_config=deploy_config,
+                    **kwargs,
+                )
             self._remember_engine_processes(startup=True)
             startup_s = time.perf_counter() - startup_t0
             if log_stats:
@@ -1063,14 +1097,15 @@ class AsyncOmniRunner(_EngineWorkerOwner):
         try:
             from vllm_omni.entrypoints.async_omni import AsyncOmni
 
-            self.engine = AsyncOmni(
-                model=model_name,
-                log_stats=log_stats,
-                stage_init_timeout=stage_init_timeout,
-                init_timeout=init_timeout,
-                deploy_config=deploy_config,
-                **kwargs,
-            )
+            with _adopt_orphaned_descendants():
+                self.engine = AsyncOmni(
+                    model=model_name,
+                    log_stats=log_stats,
+                    stage_init_timeout=stage_init_timeout,
+                    init_timeout=init_timeout,
+                    deploy_config=deploy_config,
+                    **kwargs,
+                )
         except BaseException:
             # ``with AsyncOmniRunner(...)`` never reaches ``__enter__``/``__exit__``
             # when construction fails after worker processes have started.
