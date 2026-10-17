@@ -92,6 +92,10 @@ NEUTRAL_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
         "vllm_omni.platforms.npu.models.step_audio2_token2wav",
     ): "NPU group 1: move the StepAudio2/CosyVoice NPU adaptation next to the StepAudio2 consumer package",
     (
+        "vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper",
+        "vllm_omni.platforms.npu.models.step_audio2_token2wav",
+    ): "NPU group 1 (new consumer from #8735): move the StepAudio2/CosyVoice NPU adaptation next to the StepAudio2 consumer package",
+    (
         "vllm_omni.model_executor.models.minicpmo_4_5.encoder_graph",
         "vllm_omni.platforms.npu.graph_tools",
     ): "NPU group 1 (new consumers from #8515): graph_tools is the MiniCPM-o single-consumer graph helper the RFC moves to the MiniCPM-o package",
