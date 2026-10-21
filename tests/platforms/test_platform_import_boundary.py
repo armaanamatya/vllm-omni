@@ -92,6 +92,14 @@ NEUTRAL_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
         "vllm_omni.platforms.npu.models.step_audio2_token2wav",
     ): "NPU group 1: move the StepAudio2/CosyVoice NPU adaptation next to the StepAudio2 consumer package",
     (
+        "vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav",
+        "vllm_omni.platforms.npu.models.cosyvoice2_dit_attn",
+    ): "NPU group 1 (new import from #8908): move the CosyVoice2 DiT NPU attention mask helper next to its MiniCPM-o consumer",
+    (
+        "vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav",
+        "vllm_omni.platforms.npu.models.minicpmo_fused",
+    ): "NPU group 1 (new module from #8908): minicpmo_fused is the MiniCPM-o single-consumer fused CFM DiT body the RFC moves to the MiniCPM-o package",
+    (
         "vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper",
         "vllm_omni.platforms.npu.models.step_audio2_token2wav",
     ): "NPU group 1 (new consumer from #8735): move the StepAudio2/CosyVoice NPU adaptation next to the StepAudio2 consumer package",
