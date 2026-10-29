@@ -88,6 +88,18 @@ NEUTRAL_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
         "vllm_omni.platforms.npu.omni_connectors",
     ): "NPU group 3 / rollout step 9: the connector factory should resolve the consumer-owned module",
     (
+        "vllm_omni.model_executor.models.fish_omni.fish_omni_model",
+        "vllm_omni.platforms.npu.models.fish_omni",
+    ): "NPU group 1 (new consumer from #9106): move the Drama 3 NPU eager QK-RoPE install next to the fish_omni consumer package",
+    (
+        "vllm_omni.model_executor.models.fish_omni.model_state",
+        "vllm_omni.platforms.npu.models.fish_omni_model_state",
+    ): "NPU group 1 (new module from #9106): fish_omni_model_state is the Drama 3 single-consumer NPU model state the RFC moves to the fish_omni package",
+    (
+        "vllm_omni.model_executor.models.fish_omni.quantization",
+        "vllm_omni.platforms.npu.quant.fish_omni",
+    ): "Quant-provider follow-up (RFC step 9; new module from #9106): the Drama 3 NPU quant method belongs with the quantization provider work, not platforms/npu/quant",
+    (
         "vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav",
         "vllm_omni.platforms.npu.models.step_audio2_token2wav",
     ): "NPU group 1: move the StepAudio2/CosyVoice NPU adaptation next to the StepAudio2 consumer package",
