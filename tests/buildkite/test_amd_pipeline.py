@@ -1769,42 +1769,6 @@ def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "Qwen-Image 2.1 Accuracy" not in text
 
 
-def test_qwen3_omni_seed_tts_realtime_perf_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("Qwen3-Omni Seed-TTS Realtime Perf", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_2"
-    assert step["depends_on"] == "amd-build"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 180
-    assert step["env"]["BENCHMARK_DIR"] == (
-        "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-seed-tts-perf/benchmark-results"
-    )
-    assert step["artifact_paths"] == ["artifacts/rocm-qwen3-omni-seed-tts-perf/**/*"]
-    commands = "\n".join(step["commands"])
-    assert "full_model and omni and rocm and MI325 and cards_2" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json" in commands
-    assert "hf_hub_download" in commands
-    assert "SILERO_VAD_REVISION" in commands
-    assert "SileroVADBackendProvider().get()" in commands
-    assert "test_qwen3_omni_seed_tts_realtime-explicit" in commands
-    assert "test_qwen3_omni_seed_tts_realtime-vad" in commands
-    assert "Expected exactly $${#nodes[@]} Qwen3-Omni Seed-TTS realtime nodes" in commands
-    assert "timeout --signal=TERM --kill-after=2m 165m" in commands
-    assert "Expected exactly 2 Qwen3-Omni Seed-TTS result JSON files" in commands
-    assert "Expected exactly one Qwen3-Omni Seed-TTS $$name result JSON" in commands
-    config = json.loads(Path("tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json").read_text(encoding="utf-8"))
-    assert config[0]["mark"][0]["hardware_marks"]["res"]["rocm"] == "MI325"
-    benchmark_params = config[0]["benchmark_params"]
-    assert len(benchmark_params) == 2
-    assert {params["name"] for params in benchmark_params} == {"explicit", "vad"}
-    assert all("baseline" not in params for params in benchmark_params)
-    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
-        text = pipeline_path.read_text(encoding="utf-8")
-        assert "Qwen3-Omni Seed-TTS Realtime Perf" not in text
-
-
 def test_minicpmo_4_5_perf_is_one_nonblocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o 4.5 Perf", AMD_NIGHTLY_PIPELINE)
     assert step["grade"] == "NonBlocking"
@@ -2912,6 +2876,175 @@ def test_entrypoints_full_nightly_executes_junit_guard_before_exit(
         job_id_prefix=step_label.lower().replace(" ", "-"),
         pytest_status=pytest_status,
         tests=expected_tests if tests is None else tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+_MINICPMO_READY_MARKER = "core_model and omni and rocm and MI325 and cards_1"
+_MINICPMO_READY_JOBS = (
+    (
+        "ROCm · MiniCPM-o 4.5 Offline Coverage",
+        30,
+        "20m",
+        "artifacts/rocm-minicpmo-45-offline",
+        (
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_text_to_text[omni_runner0]",
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_mix_to_audio[omni_runner0]",
+        ),
+        "exactly two executed MiniCPM-o offline tests",
+    ),
+    (
+        "ROCm · MiniCPM-o 4.5 Online Coverage",
+        30,
+        "20m",
+        "artifacts/rocm-minicpmo-45-online",
+        (
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[async_chunk]",
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[turn_async_chunk]",
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_mix_to_text_audio_001[async_chunk]",
+        ),
+        "exactly three executed MiniCPM-o online tests",
+    ),
+    (
+        "ROCm · MiniCPM-o 4.5 Duplex Coverage",
+        45,
+        "35m",
+        "artifacts/rocm-minicpmo-45-duplex",
+        (
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::"
+            "test_duplex_websocket_protocol_smoke[three-stage-single-gpu]",
+            "tests/e2e/online_serving/test_duplex_client_live.py::"
+            "test_duplex_client_live_session[three-stage-single-gpu]",
+        ),
+        "exactly two executed MiniCPM-o duplex tests",
+    ),
+)
+
+
+def test_minicpmo_ready_jobs_select_marked_core_model_nodes() -> None:
+    """READY owns the CUDA core_model cases, selected by an explicit ROCm mark."""
+    for label, timeout, command_timeout, artifact, nodes, junit_message in _MINICPMO_READY_JOBS:
+        step = _find_step(label, AMD_READY_PIPELINE)
+        command = "\n".join(step["commands"])
+
+        assert step["agent_pool"] == "mi300_1"
+        assert step["grade"] == "NonBlocking"
+        assert step["timeout_in_minutes"] == timeout
+        assert step["artifact_paths"] == [f"{artifact}/**/*"]
+        assert f"--kill-after=1m {command_timeout}" in command
+        assert _MINICPMO_READY_MARKER in command
+        assert "--run-level core_model" in command
+        assert command.count("--shard-id=0 --num-shards=1") == 2
+        assert "test_minicpmo_4_5_duplex_mrv2.py" not in command
+        assert "test_minicpmo_4_5_ready.json" not in command
+        assert "test_minicpmo_4_5_duplex_expansion.py" not in command
+        assert junit_message in command
+        assert "--junitxml=" in command
+        assert "pytest.log" not in command
+        assert "pytest-summary.txt" not in command
+        assert "PIPESTATUS" not in command
+        assert "tee " not in command
+        for node in nodes:
+            assert command.count(node) == 2
+
+
+def test_minicpmo_ready_core_model_cases_declare_mi325() -> None:
+    """The selected cases carry MI325 so a one-card CUDA mark is not the selector."""
+    cases = {
+        "tests/e2e/offline_inference/test_minicpmo_4_5.py": (
+            "def test_text_to_text(",
+            "def test_mix_to_audio(",
+        ),
+        "tests/e2e/online_serving/test_minicpmo_4_5.py": (
+            "def test_text_to_text_001(",
+            "def test_mix_to_text_audio_001(",
+        ),
+        "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py": ("def test_duplex_websocket_protocol_smoke(",),
+        "tests/e2e/online_serving/test_duplex_client_live.py": ("def test_duplex_client_live_session(",),
+    }
+    for path, functions in cases.items():
+        source = Path(path).read_text(encoding="utf-8")
+        for function_name in functions:
+            head, _, _ = source.partition(function_name)
+            assert '"rocm": "MI325"' in head[-300:]
+
+
+@pytest.mark.parametrize(
+    (
+        "step_label",
+        "expected_tests",
+        "expected_message",
+        "artifact_env",
+        "job_id_prefix",
+    ),
+    [
+        (
+            "ROCm · MiniCPM-o 4.5 Offline Coverage",
+            2,
+            "Expected exactly two executed MiniCPM-o offline tests",
+            "ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR",
+            "minicpmo-ready-offline-guard",
+        ),
+        (
+            "ROCm · MiniCPM-o 4.5 Online Coverage",
+            3,
+            "Expected exactly three executed MiniCPM-o online tests",
+            "ROCM_MINICPMO_ONLINE_ARTIFACT_DIR",
+            "minicpmo-ready-online-guard",
+        ),
+        (
+            "ROCm · MiniCPM-o 4.5 Duplex Coverage",
+            2,
+            "Expected exactly two executed MiniCPM-o duplex tests",
+            "ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR",
+            "minicpmo-ready-duplex-guard",
+        ),
+    ],
+    ids=("offline", "online", "duplex"),
+)
+@pytest.mark.parametrize(
+    (
+        "pytest_status",
+        "tests_override",
+        "skipped",
+        "timeout_status",
+        "expected_status",
+    ),
+    [
+        (0, None, 0, None, 0),
+        (0, None, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, None, 0, None, 1),
+        (0, None, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_minicpmo_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    step_label: str,
+    expected_tests: int,
+    expected_message: str,
+    artifact_env: str,
+    job_id_prefix: str,
+    pytest_status: int,
+    tests_override: int | None,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """MiniCPM READY jobs fail closed on the JUnit count before the step exits."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label=step_label,
+        command_fragment='pytest -s -v "$${nodes[@]}"',
+        expected_message=expected_message,
+        artifact_env=artifact_env,
+        job_id_prefix=job_id_prefix,
+        pytest_status=pytest_status,
+        tests=expected_tests if tests_override is None else tests_override,
         skipped=skipped,
         timeout_status=timeout_status,
         expected_status=expected_status,

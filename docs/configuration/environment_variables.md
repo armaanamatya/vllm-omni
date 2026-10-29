@@ -97,6 +97,7 @@ environment variables.
 | `VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S` | Positive finite seconds; unset or `<=0` disables | MiniCPM-o 4.5 Code2Wav stage; read when each Code2Wav model instance initializes | Reports the current phase, bounded request details, and the blocked owner-thread Python stack once per operation without interrupting it. Invalid or non-finite values raise `ValueError` at model startup. | Diagnostic |
 | `VLLM_OMNI_EVENT_DRIVEN_ORCH` | Defaults to on; `0`, `false`, `no` or `off` selects the legacy poll loop | Orchestrator stage-output loop; resolved at `Orchestrator` construction | Unset selects event-driven orchestration for every pipeline. Values are stripped and case-normalized; `1`, `true`, `yes` or `on` keep it enabled and any other value selects the legacy poll loop. The serving-side final-output loop always wakes on orchestrator output, independent of this setting. Set before server startup. | Experimental |
 | `VLLM_OMNI_INPUT_WAIT_TIMEOUT_S` | Float seconds; default `600`; `<=0` disables | Full-payload input coordinator, not async-chunk transfer; read when the scheduler module imports in each worker | Environment-only setting. A non-float logs a warning and uses `600`. | Stable operational control |
+| `VLLM_OMNI_MOE_PREFILL_WARMUP` | Defaults to on; `0`, `false`, `no` or `off` disables | AR stages with fused-MoE layers (CUDA/Triton, v1 model runner); read in each worker during startup warmup | Environment-only. Unset or any other value keeps it on; values are stripped and case-normalized. When on, startup runs one dummy forward per fused-MoE tuning batch size and its odd `+1` neighbour, for sizes above the largest CUDA graph capture size up to `max_num_batched_tokens`, so `fused_moe_kernel` configs do not JIT-compile during the first requests. Skipped on the v2 model runner. This adds startup time (tens of seconds on a cold cache for Qwen3-Omni). | Experimental performance control |
 | `VLLM_OMNI_ORCH_MONITOR_PATH` | Filesystem path; default `<current-working-directory>/vllm_omni_orch_monitor_<timestamp>.json` | Orchestrator monitor enabled by `--enable-orch-monitor`; read when the monitor is created | Environment-only path override. Parent directories are created; write errors are logged. | Diagnostic |
 | `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY` | `overwrite` or `immutable`; default `overwrite` | Speech server; read when speaker storage initializes | Environment-only setting. `immutable` rejects re-registering an existing uploaded voice name until it is deleted; any other value raises `ValueError` at startup. | Experimental |
 | `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` | Float seconds; default `600` | Synchronous Videos API; read when the API server module imports | Environment-only setting. A non-float raises `ValueError` during import. | Experimental |
@@ -216,7 +217,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The inventory includes 95 variables read by a single model or pipeline family. They are
+The inventory includes 93 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -225,10 +226,10 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 69 | Move a stable setting into typed stage or model configuration. |
+| Promote | 68 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
-| Internalize | 16 | Keep a debug or diagnostic switch out of public documentation and configuration. |
+| Internalize | 15 | Keep a debug or diagnostic switch out of public documentation and configuration. |
 | Deprecate/remove | 5 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing
